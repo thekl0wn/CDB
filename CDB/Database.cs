@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 
 namespace CDB
 {
+
     public class Database : IDisposable
     {
 
@@ -26,6 +27,7 @@ namespace CDB
         public string DatabaseName { get; set; } = "";
         public bool IntegratedSecurity { get; set; } = false;
         public string ServerName { get; set; } = "";
+        public CDB.Reader Reader { get; private set; }
 
         private SqlCommand _Command;
         private SqlConnection _Connection;
@@ -49,16 +51,28 @@ namespace CDB
             // ensure connection is allowed
             if (!this.ValidateConnection()) return false;
 
-            // create connection if needed
-            if (_Connection == null) _Connection = new SqlConnection(this._ConnectionString);
+            try
+            {
+                // create connection if needed
+                if (_Connection == null) _Connection = new SqlConnection(this._ConnectionString);
 
-            // open
-            _Connection.Open();
+                // open
+                _Connection.Open();
+            }
+            catch(Exception e)
+            {
+                this.Disconnect();
+                this.Error(e);
+                return false;
+            }
 
             // check state
             if(_Connection.State == System.Data.ConnectionState.Open)
             {
                 // success
+                var args = EventArgs.Empty;
+                var handler = this.OnConnect;
+                handler?.Invoke(this, args);
                 return true;
             }
             else
@@ -70,12 +84,24 @@ namespace CDB
 
         private bool CreateCommand(string sql)
         {
+            // validate the sql
+            if (!this.ValidateSql(sql)) return false;
+
             // connect
             if (!this.Connect()) return false;
 
-            // create / setup the command
-            _Command = _Connection.CreateCommand();
-            _Command.CommandText = sql;
+            try
+            {
+                // create / setup the command
+                _Command = _Connection.CreateCommand();
+                _Command.CommandText = sql;
+            }
+            catch(Exception e)
+            {
+                this.Disconnect();
+                this.Error(e);
+                return false;
+            }
 
             // default
             return true;
@@ -83,7 +109,23 @@ namespace CDB
 
         public void Disconnect()
         {
+            // check reader
+            if (this.Reader != null) this.Reader.Dispose();
 
+            // check command
+            if(_Command != null)_Command.Dispose();
+
+            // check connection
+            if(_Connection != null)
+            {
+                if(_Connection.State != System.Data.ConnectionState.Closed)
+                {
+                    _Connection.Close();
+                    var args = EventArgs.Empty;
+                    var handler = this.OnDisconnect;
+                    handler?.Invoke(this, args);
+                }
+            }
         }
 
         public void Dispose()
@@ -97,22 +139,37 @@ namespace CDB
                 _Connection.Dispose();
                 _Connection = null;
             }
+
+            // event
+            var args = EventArgs.Empty;
+            var handler = this.OnDispose;
+            handler?.Invoke(this, args);
         }
 
         public bool Execute(string sql) { return this.Execute(sql, -999); }
         public bool Execute(string sql, int expected_result)
         {
-            // validate the sql
-            if (!this.ValidateSql(sql)) return false;
-
             // create the command
             if (!this.CreateCommand(sql)) return false;
 
-            // execute as non-query
-            var result = _Command.ExecuteNonQuery();
+            var result = -888;
+            try
+            {
+                // execute as non-query
+                result = _Command.ExecuteNonQuery();
+            }
+            catch(Exception e)
+            {
+                this.Disconnect();
+                this.Error(e);
+                return false;
+            }
 
             // disconnect
             this.Disconnect();
+
+            // execute event
+            this.ExecuteEvent(sql, result, expected_result);
 
             // check result
             if(expected_result != -999)
@@ -154,6 +211,173 @@ namespace CDB
             return true;
         }
 
+        public bool Scalar(string sql, out object obj)
+        {
+            // set object to null as default
+            obj = null;
+
+            // create command
+            if (!this.CreateCommand(sql)) return false;
+
+            try
+            {
+                // execute the scalar into object
+                obj = _Command.ExecuteScalar();
+            }
+            catch(Exception e)
+            {
+                this.Disconnect();
+                this.Error(e);
+                return false;
+            }
+
+            // disconnect
+            this.Disconnect();
+
+            // check/return
+            if(obj == null)
+            {
+                return false;
+            }
+            else
+            {
+                var args = new ScalarEventArgs(sql, obj.ToString());
+                var handler = this.OnScalar;
+                handler?.Invoke(this, args);
+                return true;
+            }
+        }
+        public bool Scalar(string sql, out string value)
+        {
+            // set string to blank as default
+            value = "";
+
+            // get the scalar object
+            object obj;
+            if (!this.Scalar(sql, out obj)) return false;
+
+            // convert object to string for output value
+            value = obj.ToString();
+
+            // default
+            return true;
+        }
+        public bool Scalar(string sql, out int value)
+        {
+            // set default output
+            value = 0;
+
+            // get string value
+            string str;
+            if(!this.Scalar(sql, out str)) return false;
+
+            // try to convert to integer
+            if (!int.TryParse(str, out value)) return false;
+
+            // default
+            return true;
+        }
+        public bool Scalar(string sql, out decimal value)
+        {
+            // set default output
+            value = 0;
+
+            // get string value
+            string str;
+            if (!this.Scalar(sql, out str)) return false;
+
+            // try to convert to integer
+            if (!decimal.TryParse(str, out value)) return false;
+
+            // default
+            return true;
+        }
+        public bool Scalar(string sql, out DateTime value)
+        {
+            // set default output
+            value = DateTime.MinValue;
+
+            // get string value
+            string str;
+            if (!this.Scalar(sql, out str)) return false;
+
+            // try to convert to integer
+            if (!DateTime.TryParse(str, out value)) return false;
+
+            // default
+            return true;
+        }
+        public bool Scalar(string sql, out Guid value)
+        {
+            // set default output
+            value = Guid.Empty;
+
+            // get string value
+            string str;
+            if (!this.Scalar(sql, out str)) return false;
+
+            // try to convert to integer
+            if (!Guid.TryParse(str, out value)) return false;
+
+            // default
+            return true;
+        }
+        public bool Scalar(string sql, out bool value)
+        {
+            // set default output
+            value = false;
+
+            // get integer value
+            int i;
+            if (!this.Scalar(sql, out i)) return false;
+
+            // convert to boolean
+            if(i == 1)
+            {
+                value = true;
+            }
+            else
+            {
+                value = false;
+            }
+
+            // default
+            return true;
+        }
+
+        public bool Scalar(StringBuilder sql, out object obj) { return this.Scalar(sql.ToString(), out obj); }
+        public bool Scalar(StringBuilder sql, out string value) { return this.Scalar(sql.ToString(), out value); }
+        public bool Scalar(StringBuilder sql, out int value) { return this.Scalar(sql.ToString(), out value); }
+        public bool Scalar(StringBuilder sql, out decimal value) { return this.Scalar(sql.ToString(), out value); }
+        public bool Scalar(StringBuilder sql, out DateTime value) { return this.Scalar(sql.ToString(), out value); }
+        public bool Scalar(StringBuilder sql, out Guid value) { return this.Scalar(sql.ToString(), out value); }
+        public bool Scalar(StringBuilder sql, out bool value) { return this.Scalar(sql.ToString(), out value); }
+
+        public bool StartReader(string sql)
+        {
+            // create the command
+            if (!this.CreateCommand(sql)) return false;
+
+            try
+            {
+                // set the reader object
+                this.Reader = new Reader();
+                this.Reader.InternalReader = _Command.ExecuteReader();
+            }
+            catch(Exception e)
+            {
+                this.Disconnect();
+                this.Error(e);
+                return false;
+            }
+
+            // do not disconnect... that is calling method's responsibility
+
+            // default
+            return true;
+        }
+        public bool StartReader(StringBuilder sql) { return this.StartReader(sql.ToString()); }
+
         private bool ValidateConnection()
         {
             if (string.IsNullOrEmpty(this.DatabaseName))
@@ -186,5 +410,152 @@ namespace CDB
             return true;
         }
 
+        private void Error(Exception e) { this.Error(e.Message); }
+        private void Error(string error)
+        {
+            var args = new ErrorEventArgs(error);
+            var handler = this.OnError;
+            handler?.Invoke(this, args);
+        }
+        private void ExecuteEvent(string sql, int result, int expected)
+        {
+            var args = new ExecuteEventArgs(sql, result, expected);
+            var handler = this.OnExecute;
+            handler?.Invoke(this, args);
+        }
+
+        public event EventHandler<EventArgs> OnConnect;
+        public event EventHandler<EventArgs> OnDisconnect;
+        public event EventHandler<EventArgs> OnDispose;
+        public event EventHandler<ErrorEventArgs> OnError;
+        public event EventHandler<ExecuteEventArgs> OnExecute;
+        public event EventHandler<ScalarEventArgs> OnScalar;
+
     }
+
+    public class Reader : IDisposable
+    {
+
+        internal SqlDataReader InternalReader 
+        { 
+            get { return _InternalReader; }
+            set
+            {
+                _InternalReader = value;
+                this.CurrentRow = -1;
+            }
+        }
+        private SqlDataReader _InternalReader;
+
+        public bool HasRows { get { return this.InternalReader.HasRows; } }
+        public int CurrentRow { get; private set; } = -1;
+        public void Dispose()
+        {
+            if (this.InternalReader != null)
+            {
+                this.InternalReader.Dispose();
+                this.InternalReader = null;
+            }
+        }
+
+        public string GetString(int field) { return this.InternalReader.GetString(field); }
+        public string GetString(string field) { return this.GetString(this.GetFieldId(field)); }
+        public bool GetBoolean(int field) { return this.InternalReader.GetBoolean(field); }
+        public bool GetBoolean(string field) { return this.GetBoolean(this.GetFieldId(field)); }
+        public decimal GetDecimal(int field) { return this.InternalReader.GetDecimal(field); }
+        public decimal GetDecimal(string field) { return this.GetDecimal(this.GetFieldId(field)); }
+        public int GetInt(int field) { return this.InternalReader.GetInt32(field); }
+        public int GetInt(string field) { return this.GetInt(this.GetFieldId(field)); }
+        public DateTime GetDateTime(int field) { return this.InternalReader.GetDateTime(field); }
+        public DateTime GetDateTime(string field) { return this.GetDateTime(this.GetFieldId(field)); }
+        public Guid GetGuid(int field) { return this.InternalReader.GetGuid(field); }
+        public Guid GetGuid(string field) { return this.GetGuid(this.GetFieldId(field)); }
+
+        public int GetFieldId(string field)
+        {
+            // field id variable
+            int id = -1;
+
+            // format incoming
+            field = field.Trim().ToLower();
+
+            // loop through the fields in the reader
+            for (int f = 0; f < this.InternalReader.FieldCount; f++)
+            {
+                var name = this.InternalReader.GetName(f).Trim().ToLower();
+                if (name == field) return f;
+            }
+
+            // return the field id
+            return id;
+        }
+
+        public bool Read() 
+        {
+            this.CurrentRow++;
+            var read = this.InternalReader.Read();
+            if (read)
+            {
+                var args = new ReadEventArgs(this.CurrentRow);
+                var handler = this.OnRead;
+                handler?.Invoke(this, args);
+            }
+            return read;
+        }
+
+        public event EventHandler<ReadEventArgs> OnRead;
+
+    }
+        
+    public class ErrorEventArgs : EventArgs
+    {
+        public ErrorEventArgs(string message)
+        {
+            Message = message;
+        }
+
+        public string Message { get; } = "";
+    }
+    public class ExecuteEventArgs : EventArgs
+    {
+        public ExecuteEventArgs(string sql, int result, int expected)
+        {
+            this.Sql = sql;
+            this.Result = result;
+            this.ExpectedResult = expected;
+            if(this.Result == this.ExpectedResult)
+            {
+                this.Success = true;
+            }
+            else
+            {
+                this.Success = false;
+            }
+        }
+
+        public string Sql { get; } = "";
+        public int Result { get; } = 0;
+        public int ExpectedResult { get; } = 0;
+        public bool Success { get; } = true;
+    }
+    public class ReadEventArgs
+    {
+        public ReadEventArgs(int row)
+        {
+            this.Row = row;
+        }
+        public int Row { get; } = -1;
+    }
+    public class ScalarEventArgs
+    {
+        public ScalarEventArgs(string sql, string value)
+        {
+            Sql = sql;
+            Value = value;
+        }
+    
+        public string Sql { get; } = "";
+        public string Value { get; } = "";
+    }
+
 }
